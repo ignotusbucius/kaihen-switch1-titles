@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Never commit game code or console output: captures, donors, logs, dumps
+*.nsp
+*.nso
+*.nca
+*.nro
+*.npdm
+/s1/
+/captures/
+/donors/
+hen-*.txt
+*.zip

@@ -1,0 +1,1747 @@
+diff --git a/README.md b/README.md
+index 7cc3fcf..dd3d2ff 100644
+--- a/README.md
++++ b/README.md
+@@ -28,6 +28,12 @@ HEN is started from various acquisition tools available for Switch 2. Run a
+ native game by holding R. The second launch and onwards will launch into
+ hbmenu.
+ 
++A Switch 1 game started with R held launches into hbmenu when a donor
++package is on the SD card: its own at `/kaihen/bin/s1/<program ID>.nsp`, or
++the shared `/kaihen/bin/s1/default.nsp` built from another Switch 1 game (see
++`hen/README.md`). Without one it starts normally. A Switch 1 game does not
++need a native game to have been launched first.
++
+ ## Developing homebrew
+ 
+ See the devkit repository,
+diff --git a/common/package.hpp b/common/package.hpp
+index c3a647f..24b13eb 100644
+--- a/common/package.hpp
++++ b/common/package.hpp
+@@ -56,6 +56,10 @@ class NativePackage {
+         return 0;
+     }
+ 
++    /// Whether FS opened the package. A failed open() that leaves this false
++    /// changed nothing and may be retried with another path.
++    bool opened() const { return opened_; }
++
+     void close() {
+         if (opened_) {
+             fsFsClose(&filesystem_);
+diff --git a/common/sd_writer.cpp b/common/sd_writer.cpp
+index 907ce37..cdf924b 100644
+--- a/common/sd_writer.cpp
++++ b/common/sd_writer.cpp
+@@ -16,6 +16,8 @@ bool isSdFilePath(const char* path) {
+     return path && path[0] == '/' && path[1] != '\0' && std::strlen(path) < FS_MAX_PATH;
+ }
+ 
++} // namespace
++
+ Result openSdCardFileSystem(Handle root, FsFileSystem* out) {
+     Service service = {};
+     serviceCreate(&service, root);
+@@ -26,7 +28,7 @@ Result openSdCardFileSystem(Handle root, FsFileSystem* out) {
+     );
+ }
+ 
+-Result createParents(FsFileSystem* filesystem, const char* path) {
++Result createSdParents(FsFileSystem* filesystem, const char* path) {
+     char parent[FS_MAX_PATH] = {};
+     std::strncpy(parent, path, sizeof(parent) - 1);
+ 
+@@ -52,8 +54,6 @@ Result createParents(FsFileSystem* filesystem, const char* path) {
+     return 0;
+ }
+ 
+-} // namespace
+-
+ SdWriter::~SdWriter() {
+     close();
+ }
+@@ -70,7 +70,7 @@ Result SdWriter::begin(Handle root, const char* path, u64 size) {
+     }
+     filesystem_open_ = true;
+ 
+-    rc = createParents(&filesystem_, path);
++    rc = createSdParents(&filesystem_, path);
+     if (R_FAILED(rc)) {
+         close();
+         return rc;
+diff --git a/common/sd_writer.hpp b/common/sd_writer.hpp
+index 59e8394..cc9a994 100644
+--- a/common/sd_writer.hpp
++++ b/common/sd_writer.hpp
+@@ -3,6 +3,12 @@
+ 
+ #include <switch.h>
+ 
++// Open the SD card on the caller's initialized FS root, which stays open.
++Result openSdCardFileSystem(Handle root, FsFileSystem* out);
++
++// Create every missing directory above an absolute path on the SD card.
++Result createSdParents(FsFileSystem* filesystem, const char* path);
++
+ // One SD file replacement owned by the PC upload connection. The caller
+ // supplies an already-initialized FS root; the writer never reinitializes it.
+ class SdWriter {
+diff --git a/hen/README.md b/hen/README.md
+index 3a8f363..57718f3 100644
+--- a/hen/README.md
++++ b/hen/README.md
+@@ -64,3 +64,27 @@ When the player holds R while starting a native game, HEN lets the game's
+ process start with the homebrew loader in place of the game. The first such
+ launch runs the game normally while HEN saves its signed policy to the SD
+ card; later launches start hbloader, which runs hbmenu.
++
++A Switch 1 game, which Switch 2 runs in compatibility mode, keeps its
++Switch 1 program ID, and Loader mounts its code with no content attributes.
++Loader loads all of its modules (`rtld`, `main`, `subsdk*`, `sdk`) from that
++mount, so the package that HEN swaps in has to be built from the title's
++own ExeFS, with hbloader in place of `rtld`. HEN looks for it at
++`/kaihen/bin/s1/<program ID>.nsp` on the SD card, the program ID as 16
++lowercase hex digits. A title whose own package is absent, or does not open,
++uses `/kaihen/bin/s1/default.nsp` instead. Loader reads the title's own
++`main.npdm` before HEN swaps the package in, so the title's policy (64-bit
++or 32-bit, address space, memory) governs the donor's modules. A default
++built from another 64-bit Switch 1 game has started hbmenu from other
++Switch 1 games in testing; a 32-bit game is not expected to work with it. With a package that Loader accepts, an R
++launch of the game starts hbmenu; with one it refuses, the launch ends and
++the game can be started again; with neither, the game starts normally, and
++while it runs HEN builds `default.nsp` from that game's ExeFS and hbloader
++(`/kaihen/bin/game/main`), so that the next R launch of that game, and of
++other 64-bit Switch 1 games, starts hbmenu. HEN writes it as
++`default.nsp.part` and renames it only once it is complete. A 32-bit
++game, or any build refused before copying starts, leaves the build to a
++later game; a game that exits during the copy, or a copy that fails, leaves
++no `default.nsp` and uses up that HEN session's one build. HEN does not
++build the per-title packages. A Switch 1 title does not need a saved native
++policy, so it can be the first R launch after a fresh install.
+diff --git a/hen/source/donor_build.cpp b/hen/source/donor_build.cpp
+new file mode 100644
+index 0000000..1c51570
+--- /dev/null
++++ b/hen/source/donor_build.cpp
+@@ -0,0 +1,293 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <cstring>
++#include "donor_build.hpp"
++#include "game_title.hpp"
++#include "../../common/result.hpp"
++#include "../../common/sd_writer.hpp"
++
++namespace {
++
++constexpr Result InvalidDonor = MAKERESULT(Module_Libnx, LibnxError_BadInput);
++/// FS's result for a path that does not exist.
++constexpr Result PathNotFound = MAKERESULT(2, 1);
++/// FS's result for a path that already exists.
++constexpr Result PathAlreadyExists = MAKERESULT(2, 2);
++/// Most bytes one step() copies. HEN serves its IPC between steps.
++constexpr size_t DonorChunk = 0x10000;
++alignas(0x1000) u8 g_donor_chunk[DonorChunk];
++/// The title's ExeFS listing, kept off HEN's stack; one build runs at a time.
++ounce::game::DonorFile g_donor_title[ounce::game::DonorFileLimit];
++
++/// Fails unless `path` names nothing on the SD card.
++Result checkAbsent(FsFileSystem* sd, const char* path) {
++    FsDirEntryType type = FsDirEntryType_File;
++    const Result rc = fsFsGetEntryType(sd, path, &type);
++    if (R_SUCCEEDED(rc)) return PathAlreadyExists;
++    return rc == PathNotFound ? 0 : rc;
++}
++
++/// Opens a title's code file system: readSignedPolicy's fsp-ldr command 0,
++/// OpenCodeFileSystem (common/policy_package.cpp), on the borrowed Loader root.
++Result openCodeFileSystem(Handle loader_root, u64 program_id, u8 storage_id, u8 attributes,
++                          FsFileSystem* out) {
++    R_UNLESS(loader_root != INVALID_HANDLE, InvalidDonor);
++    Service loader = {};
++    serviceCreate(&loader, loader_root);
++    loader.own_handle = false;
++    const struct {
++        u8 attributes;
++        u8 storage_id;
++        u64 program_id;
++    } request = {attributes, storage_id, program_id};
++    u8 code_info[0x1a4] = {};
++    *out = {};
++    return serviceDispatchIn(&loader, 0, request,
++        .buffer_attrs = {SfBufferAttr_HipcMapAlias | SfBufferAttr_Out},
++        .buffers = {{code_info, sizeof(code_info)}},
++        .out_num_objects = 1,
++        .out_objects = &out->s,
++    );
++}
++
++/// "/<name>" in FS's path buffer, for a name that isDonorName takes.
++void codePath(char (&out)[FS_MAX_PATH], const char* name) {
++    static_assert(ounce::game::DonorNameLimit + 2 <= FS_MAX_PATH);
++    out[0] = '/';
++    std::memcpy(out + 1, name, std::strlen(name) + 1);
++}
++
++} // namespace
++
++ounce::game::DonorPlan& donorPlanStorage() {
++    static ounce::game::DonorPlan plan = {};
++    return plan;
++}
++
++Switch1DonorBuild::~Switch1DonorBuild() {
++    abandon();
++}
++
++void Switch1DonorBuild::abandon() {
++    if (source_open_) {
++        fsFileClose(&source_);
++        source_open_ = false;
++    }
++    if (part_open_) {
++        fsFileClose(&part_);
++        part_open_ = false;
++    }
++    if (part_created_ && sd_open_) {
++        fsFsDeleteFile(&sd_, ounce::game::Switch1DefaultDonorPart);
++        fsFsCommit(&sd_);
++    }
++    part_created_ = false;
++    if (sd_open_) {
++        fsFsClose(&sd_);
++        sd_open_ = false;
++    }
++    if (code_open_) {
++        fsFsClose(&code_);
++        code_open_ = false;
++    }
++}
++
++Result Switch1DonorBuild::begin(Handle loader_root, Handle fs_root, u64 program_id,
++                                u8 storage_id, const char* hbloader_path) {
++    abandon();
++    position_ = 0;
++    copied_ = 0;
++    written_ = 0;
++    plan_.count = 0;
++    stage_ = Stage_CodeFileSystem;
++    const auto run = [&]() -> Result {
++        R_UNLESS(hbloader_path && std::strlen(hbloader_path) < sizeof(hbloader_path_),
++                 InvalidDonor);
++        std::strcpy(hbloader_path_, hbloader_path);
++        R_TRY(openCodeFileSystem(loader_root, program_id, storage_id,
++                                 ounce::game::Switch1CodeAttributes, &code_));
++        code_open_ = true;
++
++        stage_ = Stage_List;
++        ounce::game::DonorFile* const title = g_donor_title;
++        std::memset(g_donor_title, 0, sizeof(g_donor_title));
++        u32 title_count = 0;
++        R_TRY(listTitle(title, title_count));
++        stage_ = Stage_Policy;
++        R_TRY(checkPolicy());
++
++        stage_ = Stage_SdCard;
++        R_TRY(openSdCardFileSystem(fs_root, &sd_));
++        sd_open_ = true;
++        stage_ = Stage_DonorAbsent;
++        R_TRY(checkAbsent(&sd_, ounce::game::Switch1DefaultDonorFile));
++
++        stage_ = Stage_Hbloader;
++        FsFile hbloader = {};
++        R_TRY(fsFsOpenFile(&sd_, hbloader_path_, FsOpenMode_Read, &hbloader));
++        s64 hbloader_size = 0;
++        const Result size_rc = fsFileGetSize(&hbloader, &hbloader_size);
++        fsFileClose(&hbloader);
++        R_TRY(size_rc);
++        R_UNLESS(hbloader_size > 0, InvalidDonor);
++
++        stage_ = Stage_Plan;
++        R_UNLESS(ounce::game::planDonor(title, title_count, static_cast<u64>(hbloader_size),
++                                        plan_),
++                 InvalidDonor);
++
++        // A part file left by an earlier HEN session that stopped mid-copy is
++        // replaced; nothing opens it.
++        stage_ = Stage_CreatePart;
++        const char* part = ounce::game::Switch1DefaultDonorPart;
++        R_TRY(createSdParents(&sd_, part));
++        FsDirEntryType type = FsDirEntryType_Dir;
++        if (R_SUCCEEDED(fsFsGetEntryType(&sd_, part, &type))) {
++            R_UNLESS(type == FsDirEntryType_File, InvalidDonor);
++            R_TRY(fsFsDeleteFile(&sd_, part));
++        }
++        R_TRY(fsFsCreateFile(&sd_, part, static_cast<s64>(plan_.size), 0));
++        part_created_ = true;
++        R_TRY(fsFsOpenFile(&sd_, part, FsOpenMode_Write, &part_));
++        part_open_ = true;
++        R_TRY(fsFileWrite(&part_, 0, plan_.header, plan_.header_size, FsWriteOption_None));
++        written_ = plan_.header_size;
++        stage_ = Stage_Copy;
++        R_SUCCEED();
++    };
++    const Result rc = run();
++    if (R_FAILED(rc)) abandon();
++    return rc;
++}
++
++Result Switch1DonorBuild::listTitle(ounce::game::DonorFile* title, u32& count) {
++    count = 0;
++    char root[FS_MAX_PATH] = "/";
++    FsDir directory = {};
++    R_TRY(fsFsOpenDirectory(&code_, root, FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles,
++                            &directory));
++    Result rc = 0;
++    for (;;) {
++        FsDirectoryEntry entry = {};
++        s64 read = 0;
++        rc = fsDirRead(&directory, &read, 1, &entry);
++        if (R_FAILED(rc) || read == 0) break;
++        entry.name[sizeof(entry.name) - 1] = '\0';
++        // A donor is flat: a directory, a name a donor does not take, or too
++        // many files refuses the whole title.
++        if (read != 1 || entry.type != FsDirEntryType_File || entry.file_size < 0 ||
++            count == ounce::game::DonorFileLimit ||
++            !ounce::game::isDonorName(entry.name)) {
++            rc = InvalidDonor;
++            break;
++        }
++        ounce::game::DonorFile& file = title[count++];
++        std::strcpy(file.name, entry.name);
++        file.size = static_cast<u64>(entry.file_size);
++        file.hbloader = false;
++    }
++    fsDirClose(&directory);
++    return rc;
++}
++
++Result Switch1DonorBuild::checkPolicy() {
++    char path[FS_MAX_PATH] = {};
++    codePath(path, "main.npdm");
++    FsFile file = {};
++    R_TRY(fsFsOpenFile(&code_, path, FsOpenMode_Read, &file));
++    u8 meta[ounce::game::MetaFlagsOffset + 1] = {};
++    u64 read = 0;
++    Result rc = fsFileRead(&file, 0, meta, sizeof(meta), FsReadOption_None, &read);
++    fsFileClose(&file);
++    R_TRY(rc);
++    R_UNLESS(ounce::game::isDonorPolicy(meta, read), InvalidDonor);
++    R_SUCCEED();
++}
++
++Result Switch1DonorBuild::step(bool& complete) {
++    complete = false;
++    Result rc = InvalidDonor;
++    if (part_open_) {
++        rc = position_ < plan_.count ? copyChunk() : finish(complete);
++    }
++    if (R_FAILED(rc)) abandon();
++    return rc;
++}
++
++Result Switch1DonorBuild::openSource() {
++    const ounce::game::DonorFile& file = plan_.files[position_];
++    char path[FS_MAX_PATH] = {};
++    if (file.hbloader) {
++        std::strcpy(path, hbloader_path_);
++    } else {
++        codePath(path, file.name);
++    }
++    R_TRY(fsFsOpenFile(file.hbloader ? &sd_ : &code_, path, FsOpenMode_Read, &source_));
++    source_open_ = true;
++    copied_ = 0;
++    s64 size = 0;
++    R_TRY(fsFileGetSize(&source_, &size));
++    // The file must still be the size that the header gives it.
++    R_UNLESS(size >= 0 && static_cast<u64>(size) == file.size, InvalidDonor);
++
++    // Up to 31 zero bytes align the file's data.
++    const u64 offset = plan_.offsets[position_];
++    R_UNLESS(written_ <= offset && offset - written_ < 0x20, InvalidDonor);
++    if (offset > written_) {
++        const u8 padding[0x20] = {};
++        R_TRY(fsFileWrite(&part_, static_cast<s64>(written_), padding, offset - written_,
++                          FsWriteOption_None));
++        written_ = offset;
++    }
++    R_SUCCEED();
++}
++
++Result Switch1DonorBuild::copyChunk() {
++    if (!source_open_) R_TRY(openSource());
++    const ounce::game::DonorFile& file = plan_.files[position_];
++    const u64 left = file.size - copied_;
++    const u64 wanted = left < DonorChunk ? left : DonorChunk;
++    if (wanted) {
++        u64 received = 0;
++        R_TRY(fsFileRead(&source_, static_cast<s64>(copied_), g_donor_chunk, wanted,
++                         FsReadOption_None, &received));
++        R_UNLESS(received == wanted, InvalidDonor);
++        if (!copied_) {
++            // The module and policy files must be what Loader expects.
++            const char* magic = ounce::game::donorMagic(file.name);
++            R_UNLESS(!magic || (wanted >= 4 && !std::memcmp(g_donor_chunk, magic, 4)),
++                     InvalidDonor);
++        }
++        R_TRY(fsFileWrite(&part_, static_cast<s64>(written_), g_donor_chunk, wanted,
++                          FsWriteOption_None));
++        copied_ += wanted;
++        written_ += wanted;
++    } else {
++        // An empty file has no magic: only one without a required magic is taken.
++        R_UNLESS(!ounce::game::donorMagic(file.name), InvalidDonor);
++    }
++    if (copied_ == file.size) {
++        fsFileClose(&source_);
++        source_open_ = false;
++        position_++;
++    }
++    R_SUCCEED();
++}
++
++Result Switch1DonorBuild::finish(bool& complete) {
++    stage_ = Stage_Finish;
++    R_UNLESS(written_ == plan_.size, InvalidDonor);
++    Result rc = fsFileFlush(&part_);
++    fsFileClose(&part_);
++    part_open_ = false;
++    R_TRY(rc);
++    R_TRY(fsFsCommit(&sd_));
++    // A donor that appeared meanwhile is kept; this build is dropped.
++    R_TRY(checkAbsent(&sd_, ounce::game::Switch1DefaultDonorFile));
++    R_TRY(fsFsRenameFile(&sd_, ounce::game::Switch1DefaultDonorPart,
++                         ounce::game::Switch1DefaultDonorFile));
++    part_created_ = false;
++    complete = true;
++    rc = fsFsCommit(&sd_);
++    abandon();
++    return rc;
++}
+diff --git a/hen/source/donor_build.hpp b/hen/source/donor_build.hpp
+new file mode 100644
+index 0000000..3fcfa4a
+--- /dev/null
++++ b/hen/source/donor_build.hpp
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++#include <switch.h>
++#include "donor_layout.hpp"
++
++/// Builds the shared Switch 1 donor (game_title.hpp Switch1DefaultDonorFile)
++/// from a running Switch 1 title's ExeFS, in bounded steps. The package is
++/// written to Switch1DefaultDonorPart and renamed only once every byte is
++/// written and committed; any failure, and abandon(), deletes the part file,
++/// so the donor's name never holds a partial package.
++/// The one DonorPlan a Switch1DonorBuild uses, kept off HEN's stack.
++ounce::game::DonorPlan& donorPlanStorage();
++
++class Switch1DonorBuild {
++  public:
++    /// Where a build stopped, for the trace: bits 8 and up of trace().
++    enum Stage : u32 {
++        Stage_CodeFileSystem = 1,
++        Stage_List = 2,
++        Stage_Policy = 3,
++        Stage_SdCard = 4,
++        Stage_DonorAbsent = 5,
++        Stage_Hbloader = 6,
++        Stage_Plan = 7,
++        Stage_CreatePart = 8,
++        Stage_Copy = 9,
++        Stage_Finish = 10,
++    };
++
++    ~Switch1DonorBuild();
++
++    /// Lists the title's code file system, plans the donor and writes its
++    /// header to the part file. A failure has already abandoned the build.
++    Result begin(Handle loader_root, Handle fs_root, u64 program_id, u8 storage_id,
++                 const char* hbloader_path);
++    /// Copies at most one chunk; once every file is copied, commits the part
++    /// file and renames it, and sets `complete`. A failure has already
++    /// abandoned the build.
++    Result step(bool& complete);
++    /// Closes every file and deletes the part file, if it exists.
++    void abandon();
++    /// The stage reached in bits 8 and up, the package file index in the low byte.
++    u32 trace() const { return (stage_ << 8) | (position_ & 0xff); }
++    u32 count() const { return plan_.count; }
++
++  private:
++    Result listTitle(ounce::game::DonorFile* title, u32& count);
++    Result checkPolicy();
++    Result openSource();
++    Result copyChunk();
++    Result finish(bool& complete);
++
++    FsFileSystem code_ = {};
++    FsFileSystem sd_ = {};
++    FsFile source_ = {};
++    FsFile part_ = {};
++    bool code_open_ = false;
++    bool sd_open_ = false;
++    bool source_open_ = false;
++    bool part_open_ = false;
++    /// The part file exists on SD and is this build's to delete.
++    bool part_created_ = false;
++    u32 stage_ = 0;
++    /// The package file being copied.
++    u32 position_ = 0;
++    /// Bytes of that file already copied.
++    u64 copied_ = 0;
++    /// Bytes of the part file already written.
++    u64 written_ = 0;
++    char hbloader_path_[FS_MAX_PATH] = {};
++    /// File-static storage (donor_build.cpp): only one build runs at a time.
++    ounce::game::DonorPlan& plan_ = donorPlanStorage();
++};
+diff --git a/hen/source/donor_layout.hpp b/hen/source/donor_layout.hpp
+new file mode 100644
+index 0000000..6119fff
+--- /dev/null
++++ b/hen/source/donor_layout.hpp
+@@ -0,0 +1,238 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++// The layout of a Switch 1 title's donor package: a flat PFS0 holding
++// hbloader as rtld and the title's other ExeFS files, in the order and with
++// the header that writeExeFsPackage (common/policy_package.cpp) uses for two
++// files. Only the libnx types, so that host tests build it.
++extern "C" {
++#include <switch/types.h>
++}
++
++namespace ounce::game {
++
++/// Most files a donor holds, and most files a title's ExeFS may list.
++constexpr u32 DonorFileLimit = 24;
++/// Longest ExeFS file name a donor takes.
++constexpr size_t DonorNameLimit = 64;
++/// Largest ExeFS file a donor takes.
++constexpr u64 DonorFileSizeLimit = 0x10000000;
++/// PFS0 header, one 24-byte entry per file, then the names.
++constexpr size_t DonorHeaderCapacity =
++    16 + DonorFileLimit * 24 + DonorFileLimit * (DonorNameLimit + 1);
++
++struct DonorFile {
++    char name[DonorNameLimit + 1];
++    u64 size;
++    /// The file is hbloader from SD, not one of the title's.
++    bool hbloader;
++};
++
++struct DonorPlan {
++    /// The package's files, in package order.
++    DonorFile files[DonorFileLimit];
++    /// Where each file's data starts, from the start of the package.
++    u64 offsets[DonorFileLimit];
++    u32 count;
++    /// The PFS0 header, entries and names: header[0, header_size).
++    u32 header_size;
++    /// The whole package; the last file is not padded.
++    u64 size;
++    u8 header[DonorHeaderCapacity];
++};
++
++namespace donor_detail {
++
++constexpr size_t length(const char* text) {
++    size_t count = 0;
++    while (text[count]) count++;
++    return count;
++}
++
++constexpr int compare(const char* left, const char* right) {
++    while (*left && *left == *right) {
++        left++;
++        right++;
++    }
++    return static_cast<unsigned char>(*left) - static_cast<unsigned char>(*right);
++}
++
++constexpr bool startsWith(const char* text, const char* prefix) {
++    while (*prefix) {
++        if (*text++ != *prefix++) return false;
++    }
++    return true;
++}
++
++/// The digits of "subsdk<digits>", or nullptr for any other name.
++constexpr const char* subsdkDigits(const char* name) {
++    if (!startsWith(name, "subsdk") || !name[6]) return nullptr;
++    for (const char* digit = name + 6; *digit; digit++) {
++        if (*digit < '0' || *digit > '9') return nullptr;
++    }
++    return name + 6;
++}
++
++/// rtld, main, subsdk<n>, sdk, any other file, main.npdm.
++constexpr u32 rank(const char* name) {
++    if (!compare(name, "rtld")) return 0;
++    if (!compare(name, "main")) return 1;
++    if (subsdkDigits(name)) return 2;
++    if (!compare(name, "sdk")) return 3;
++    if (!compare(name, "main.npdm")) return 5;
++    return 4;
++}
++
++/// Compares two digit strings by value, of any length.
++constexpr int compareNumbers(const char* left, const char* right) {
++    while (*left == '0') left++;
++    while (*right == '0') right++;
++    const size_t left_length = length(left);
++    const size_t right_length = length(right);
++    if (left_length != right_length) return left_length < right_length ? -1 : 1;
++    return compare(left, right);
++}
++
++inline void put32(u8* out, u32 value) {
++    for (int index = 0; index < 4; index++) out[index] = static_cast<u8>(value >> (8 * index));
++}
++
++inline void put64(u8* out, u64 value) {
++    for (int index = 0; index < 8; index++) out[index] = static_cast<u8>(value >> (8 * index));
++}
++
++constexpr u64 align32(u64 value) {
++    return (value + 0x1f) & ~u64(0x1f);
++}
++
++} // namespace donor_detail
++
++/// An ExeFS file name a donor takes: one path component of printable ASCII
++/// without separators or drive marks, at most DonorNameLimit characters.
++constexpr bool isDonorName(const char* name) {
++    if (!name || !name[0]) return false;
++    if (name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2]))) return false;
++    size_t count = 0;
++    for (const char* character = name; *character; character++) {
++        const unsigned char value = static_cast<unsigned char>(*character);
++        if (value <= 0x20 || value >= 0x7f || value == '/' || value == '\\' || value == ':') {
++            return false;
++        }
++        if (++count > DonorNameLimit) return false;
++    }
++    return true;
++}
++
++/// Whether `left` comes before `right` in a donor: rtld, main, subsdk<n> by
++/// the value of n, sdk, any other file by name, then main.npdm. Equal values
++/// of n, and other files, are ordered by name, byte by byte.
++constexpr bool donorBefore(const char* left, const char* right) {
++    const u32 left_rank = donor_detail::rank(left);
++    const u32 right_rank = donor_detail::rank(right);
++    if (left_rank != right_rank) return left_rank < right_rank;
++    if (left_rank == 2) {
++        const int numbers = donor_detail::compareNumbers(donor_detail::subsdkDigits(left),
++                                                         donor_detail::subsdkDigits(right));
++        if (numbers) return numbers < 0;
++    }
++    return donor_detail::compare(left, right) < 0;
++}
++
++/// The magic a donor file must start with: "NSO0" for rtld, main, sdk and
++/// subsdk*, "META" for main.npdm, nullptr for any other file.
++constexpr const char* donorMagic(const char* name) {
++    if (!donor_detail::compare(name, "main.npdm")) return "META";
++    if (!donor_detail::compare(name, "rtld") || !donor_detail::compare(name, "main") ||
++        !donor_detail::compare(name, "sdk") || donor_detail::startsWith(name, "subsdk")) {
++        return "NSO0";
++    }
++    return nullptr;
++}
++
++/// Where main.npdm's META header keeps its flags; bit 0 marks a 64-bit
++/// process. hbloader is 64-bit code, so only a 64-bit title makes a donor.
++constexpr size_t MetaFlagsOffset = 0xc;
++
++/// Whether the start of a main.npdm is a META header for a 64-bit process.
++constexpr bool isDonorPolicy(const u8* meta, size_t size) {
++    return size > MetaFlagsOffset && meta[0] == 'M' && meta[1] == 'E' && meta[2] == 'T' &&
++           meta[3] == 'A' && (meta[MetaFlagsOffset] & 1);
++}
++
++/// Plans a donor from a title's ExeFS listing and hbloader's size: hbloader
++/// as rtld, then every file of the title except its own rtld, in donorBefore
++/// order. False, with `plan` unusable, for a listing that cannot make a donor:
++/// no main or main.npdm, a name isDonorName refuses or that repeats, a file
++/// over DonorFileSizeLimit, or more than DonorFileLimit files.
++inline bool planDonor(const DonorFile* title, u32 title_count, u64 hbloader_size,
++                      DonorPlan& plan) {
++    plan.count = 0;
++    plan.header_size = 0;
++    plan.size = 0;
++    if (title_count > DonorFileLimit || hbloader_size > DonorFileSizeLimit) return false;
++
++    DonorFile& rtld = plan.files[plan.count++];
++    rtld = {};
++    __builtin_memcpy(rtld.name, "rtld", sizeof("rtld"));
++    rtld.size = hbloader_size;
++    rtld.hbloader = true;
++    bool has_main = false;
++    bool has_policy = false;
++    for (u32 index = 0; index < title_count; index++) {
++        const DonorFile& file = title[index];
++        if (!isDonorName(file.name) || file.size > DonorFileSizeLimit) return false;
++        for (u32 other = index + 1; other < title_count; other++) {
++            if (!donor_detail::compare(file.name, title[other].name)) return false;
++        }
++        has_main = has_main || !donor_detail::compare(file.name, "main");
++        has_policy = has_policy || !donor_detail::compare(file.name, "main.npdm");
++        if (!donor_detail::compare(file.name, "rtld")) continue;
++        if (plan.count == DonorFileLimit) return false;
++        DonorFile& entry = plan.files[plan.count++];
++        entry = file;
++        entry.hbloader = false;
++    }
++    if (!has_main || !has_policy) return false;
++
++    // Insertion sort: at most DonorFileLimit files.
++    for (u32 index = 1; index < plan.count; index++) {
++        const DonorFile file = plan.files[index];
++        u32 slot = index;
++        while (slot && donorBefore(file.name, plan.files[slot - 1].name)) {
++            plan.files[slot] = plan.files[slot - 1];
++            slot--;
++        }
++        plan.files[slot] = file;
++    }
++
++    u32 names_size = 0;
++    for (u32 index = 0; index < plan.count; index++) {
++        names_size += static_cast<u32>(donor_detail::length(plan.files[index].name)) + 1;
++    }
++    plan.header_size = 16 + plan.count * 24 + names_size;
++    __builtin_memset(plan.header, 0, sizeof(plan.header));
++    __builtin_memcpy(plan.header, "PFS0", 4);
++    donor_detail::put32(plan.header + 4, plan.count);
++    donor_detail::put32(plan.header + 8, names_size);
++
++    u8* names = plan.header + 16 + plan.count * 24;
++    u32 name_offset = 0;
++    u64 data_end = 0;
++    for (u32 index = 0; index < plan.count; index++) {
++        const DonorFile& file = plan.files[index];
++        // Each file starts 32-byte aligned after the previous one.
++        const u64 offset = index ? donor_detail::align32(data_end) : 0;
++        u8* entry = plan.header + 16 + index * 24;
++        donor_detail::put64(entry, offset);
++        donor_detail::put64(entry + 8, file.size);
++        donor_detail::put32(entry + 16, name_offset);
++        const size_t name_size = donor_detail::length(file.name) + 1;
++        __builtin_memcpy(names + name_offset, file.name, name_size);
++        name_offset += static_cast<u32>(name_size);
++        plan.offsets[index] = plan.header_size + offset;
++        data_end = offset + file.size;
++    }
++    plan.size = plan.header_size + data_end;
++    return true;
++}
++
++} // namespace ounce::game
+diff --git a/hen/source/game_arm.cpp b/hen/source/game_arm.cpp
+index 4d2ba21..878670e 100644
+--- a/hen/source/game_arm.cpp
++++ b/hen/source/game_arm.cpp
+@@ -2,6 +2,7 @@
+ #include <cstring>
+ #include <switch.h>
+ #include "game_arm.hpp"
++#include "game_title.hpp"
+ #include "../../common/package.hpp"
+ #include "../../common/result.hpp"
+ #include "../../libkaihen/source/cmif_server.hpp"
+@@ -15,14 +16,6 @@ constexpr Result UnexpectedState = MAKERESULT(Module_Libnx, LibnxError_BadInput)
+ constexpr Result ProcessNotFound = MAKERESULT(15, 1);
+ /// FS's result for a path that does not exist.
+ constexpr Result PathNotFound = MAKERESULT(2, 1);
+-/// The content attributes of the game's code file system, in Loader's
+-/// OpenCodeFileSystem request and in readSignedPolicy.
+-constexpr u32 GameAttributes = 1;
+-// Native titles observed here use the 0x04 namespace. This is the Switch 2
+-// analogue of Atmosphere's ncm::IsApplicationId range check; the exact native
+-// endpoints still need live qualification against more than one game title.
+-constexpr u64 ApplicationProgramIdMin = 0x0400000000010000ull;
+-constexpr u64 ApplicationProgramIdMax = 0x04ffffffffffffffull;
+ constexpr u32 NativeNpadRevision = 5;
+ constexpr char GamePackagePath[] = "@Sdcard:/kaihen/bin/game/exefs.nsp";
+ constexpr char GameMainPath[] = "/kaihen/bin/game/main";
+@@ -34,10 +27,12 @@ constexpr u32 CaptureAttempts = 20;
+ constexpr u64 CaptureIntervalNs = 1000000000;
+ /// How long sampleR waits for each controller to post a new sample.
+ constexpr u64 InputSampleIntervalNs = 50000000;
+-
+-bool isApplicationProgram(u64 program_id) {
+-    return program_id >= ApplicationProgramIdMin && program_id <= ApplicationProgramIdMax;
+-}
++/// How long an armed Switch 1 launch may have no process once Loader has
++/// closed its code mount.
++constexpr u64 Switch1ProcessTimeoutNs = 5000000000;
++/// How often an armed Switch 1 launch without a process looks for its code
++/// mount in Loader's domain.
++constexpr u64 Switch1RefusalPollNs = 100000000;
+ 
+ /// The value of a fault trace: the trace point that preceded the fault in the
+ /// high half, and that point's value (or the gate step that failed) in the low.
+@@ -214,6 +209,9 @@ void GameArm::step() {
+     case State::CapturePolicy:
+         rc = capturePolicy();
+         break;
++    case State::BuildDonor:
++        rc = buildDonor();
++        break;
+     case State::WaitExit:
+         rc = pollProcessExit();
+         break;
+@@ -269,6 +267,9 @@ Result GameArm::openPackage() {
+     active_title_ = 0;
+     active_storage_ = 0;
+     capture_pending_ = false;
++    donor_build_pending_ = false;
++    code_closed_tick_ = 0;
++    refusal_next_tick_ = 0;
+     gate_failure_step_ = 0;
+     step_started_ = false;
+     before_step_count_ = 0;
+@@ -300,15 +301,14 @@ Result GameArm::waitForInput() {
+     }
+ 
+     if (!policy_ready_) {
+-        // The first R launch stays stock. PM identifies the running title,
+-        // then its live CodeFS supplies the signed policy for later launches.
++        // No native policy is saved yet. The launch is still armed: a Switch 1
++        // title's donor carries its own policy, and a native title is let
++        // through stock at its second code mount so that its live CodeFS can
++        // supply the policy for later launches.
+         capture_pending_ = true;
+         capture_attempts_ = 0;
+         capture_next_tick_ = 0;
+-        trace_.write(GameTracePoint_FirstLaunchCapture);
+-        state_ = State::WaitProcess;
+-        status_.phase = HenGamePhase_WaitingForProcess;
+-        return 0;
++        trace_.write(GameTracePoint_FirstLaunchCapture, 0, 1);
+     }
+     state_ = State::ParkGate;
+     status_.phase = HenGamePhase_Parking;
+@@ -341,8 +341,8 @@ Result GameArm::inspectGameRequest(const u8 request[ounce::LoaderRequestSize],
+     // Any application from any storage: the R selection decides which launch
+     // is armed, not the title.
+     const ounce::CodeMountArguments& arguments = decoded.arguments;
+-    if (!decoded.open_code || arguments.content_attributes != GameAttributes ||
+-        !isApplicationProgram(arguments.program_id)) {
++    if (!decoded.open_code ||
++        !ounce::game::isGameCodeMount(arguments.program_id, arguments.content_attributes)) {
+         return 0;
+     }
+     title = arguments.program_id;
+@@ -506,9 +506,37 @@ Result GameArm::receiveGameMount() {
+     status_.mounts = 2;
+     // Opening a game without R never parks Loader. Once R arms a request,
+     // the selection stays latched through both CodeFS mounts.
++    // Loader loads every module of a Switch 1 title from its code FS, so the
++    // title needs a donor built from a Switch 1 ExeFS: its own, or else the
++    // shared default donor. A title with neither starts stock.
++    const bool switch1 = ounce::game::isSwitch1Application(active_title_);
++    if (switch1) {
++        // A Switch 1 title never supplies a native policy.
++        capture_pending_ = false;
++    } else if (!policy_ready_) {
++        // The native game package needs the policy this launch is to supply.
++        // No CodeFS exchange is attempted; the title continues stock.
++        trace_.write(GameTracePoint_FirstLaunchCapture, 0, 2);
++        return restoreGate(0, State::WaitProcess);
++    }
++    const ounce::game::Switch1PackagePath switch1_package(active_title_);
++    const char* package_path = switch1 ? switch1_package.text : GamePackagePath;
+     package_.emplace(*memory_, filesystem_root_);
+-    rc = package_->open(GamePackagePath, current_mount_);
+-    trace_.write(GameTracePoint_PackageOpened, rc);
++    rc = package_->open(package_path, current_mount_);
++    u32 package_kind = 0;
++    if (switch1 && R_FAILED(rc) && !package_->opened()) {
++        // The title's own package did not open and FS made no object. Try the
++        // shared default; PackageOpened value 2 = the default was tried, and
++        // its Result says whether it opened.
++        package_kind = 2;
++        rc = package_->open(ounce::game::Switch1DefaultPackagePath, current_mount_);
++    }
++    trace_.write(GameTracePoint_PackageOpened, rc, package_kind);
++    if (package_kind == 2 && R_FAILED(rc) && !package_->opened() && !donor_build_tried_) {
++        // Neither donor opened: once the title runs stock, build the default
++        // from its ExeFS for the next Switch 1 launch.
++        donor_build_pending_ = true;
++    }
+     if (R_FAILED(rc)) {
+         // No CodeFS exchange was attempted. Once Loader's original wait is
+         // restored, the pending title can continue on its stock CodeFS.
+@@ -523,7 +551,9 @@ Result GameArm::waitForProcess() {
+     Result rc = active_title_ ? pmdmntGetProcessId(&pid, active_title_)
+                               : pmdmntGetApplicationProcessId(&pid);
+     if (rc == ProcessNotFound) {
+-        return 0;
++        return status_.mounts == 2 && ounce::game::isSwitch1Application(active_title_)
++                   ? pollSwitch1Refusal()
++                   : 0;
+     }
+     if (R_FAILED(rc) || !pid) {
+         return R_FAILED(rc) ? rc : UnexpectedState;
+@@ -537,13 +567,23 @@ Result GameArm::waitForProcess() {
+         if (R_FAILED(rc)) {
+             return rc;
+         }
+-        if (!allow_bridge_process_ && !isApplicationProgram(title)) {
++        if (!allow_bridge_process_ && !ounce::game::isNativeApplication(title) &&
++            !ounce::game::isSwitch1Application(title)) {
+             return UnexpectedState;
+         }
+         active_title_ = title;
+     }
+     status_.process_id = pid;
+-    if (capture_pending_) {
++    if (donor_build_pending_ && ounce::game::isSwitch1Application(active_title_)) {
++        donor_build_pending_ = false;
++        status_.phase = HenGamePhase_WaitingForExit;
++        state_ = State::BuildDonor;
++        return 0;
++    }
++    // Only a native title's CodeFS holds a policy the native game package can
++    // use. A Switch 1 launch cleared capture_pending_ at its second code mount;
++    // one that reaches here with it set (a park or step failure) captures nothing.
++    if (capture_pending_ && ounce::game::isNativeApplication(active_title_)) {
+         state_ = State::CapturePolicy;
+         return 0;
+     }
+@@ -571,15 +611,16 @@ Result GameArm::capturePolicy() {
+ 
+     SignedPolicy policy = {};
+     // The live game's CodeFS may reside on a game card, built-in user
+-    // storage, or SD. The first launch remains stock, so its Loader request
+-    // does not pass through our mount observer to supply the storage ID.
++    // storage, or SD. Each is tried: a launch that fell back before its first
++    // code mount (a park or early step failure) has no observed storage ID.
+     const u8 storages[] = {
+         NcmStorageId_BuiltInUser,
+         NcmStorageId_SdCard,
+         NcmStorageId_GameCard,
+     };
+     for (u8 storage : storages) {
+-        rc = readSignedPolicy(loader_root_, active_title_, storage, GameAttributes, &policy);
++        rc = readSignedPolicy(loader_root_, active_title_, storage,
++                              ounce::game::NativeCodeAttributes, &policy);
+         if (R_SUCCEEDED(rc)) {
+             rc = writeExeFsPackage(filesystem_root_, GameMainPath, GamePackageFile, policy);
+             if (R_SUCCEEDED(rc)) {
+@@ -604,6 +645,56 @@ Result GameArm::capturePolicy() {
+     return 0;
+ }
+ 
++Result GameArm::buildDonor() {
++    // The title must still run: its exit, or another program in its
++    // process, abandons the build before any other step.
++    u64 program_id = 0;
++    Result rc = pmdmntGetProgramId(&program_id, status_.process_id);
++    if (rc == ProcessNotFound || R_FAILED(rc) || program_id != active_title_) {
++        if (donor_build_) donor_build_->abandon();
++        trace_.write(GameTracePoint_DonorBuildFailed, rc,
++                     donor_build_ ? donor_build_->trace() : 0);
++        endDonorBuild();
++        if (rc == ProcessNotFound) return 0;
++        return R_FAILED(rc) ? rc : UnexpectedState;
++    }
++
++    if (!donor_build_) {
++        donor_build_.emplace();
++        rc = donor_build_->begin(loader_root_, filesystem_root_, active_title_,
++                                 active_storage_, GameMainPath);
++        trace_.write(GameTracePoint_DonorBuildStarted, rc,
++                     R_SUCCEEDED(rc) ? donor_build_->count() : donor_build_->trace());
++        // A begin() that fails (32-bit, no hbloader, default.nsp present, SD
++        // create/write) has deleted its part file; it leaves the attempt for a
++        // later title.
++        if (R_FAILED(rc)) {
++            endDonorBuild();
++            return 0;
++        }
++        donor_build_tried_ = true;
++        return 0;
++    }
++
++    bool complete = false;
++    rc = donor_build_->step(complete);
++    if (complete) {
++        trace_.write(GameTracePoint_DonorBuilt, rc, donor_build_->count());
++        endDonorBuild();
++    } else if (R_FAILED(rc)) {
++        trace_.write(GameTracePoint_DonorBuildFailed, rc, donor_build_->trace());
++        endDonorBuild();
++    }
++    return 0;
++}
++
++void GameArm::endDonorBuild() {
++    // Destroying the build closes its files and deletes its part file.
++    donor_build_.reset();
++    status_.phase = HenGamePhase_WaitingForExit;
++    state_ = State::WaitExit;
++}
++
+ Result GameArm::pollProcessExit() {
+     u64 program_id = 0;
+     Result rc = pmdmntGetProgramId(&program_id, status_.process_id);
+@@ -614,6 +705,9 @@ Result GameArm::pollProcessExit() {
+         return rc;
+     }
+ 
++    // capture_pending_ implies no CodeFS exchange: it is set only without a
++    // policy, a native title then skips the exchange (receiveGameMount), and a
++    // Switch 1 title clears it before its exchange.
+     if (!capture_pending_) {
+         ounce::DomainEntry entries[ounce::MaxDomainEntries];
+         u32 count = 0;
+@@ -621,6 +715,36 @@ Result GameArm::pollProcessExit() {
+         R_TRY(final_mount.snapshot(entries, count));
+         if (containsEntry(entries, count, code_.address)) return 0;
+     }
++    endLaunch();
++    return 0;
++}
++
++Result GameArm::pollSwitch1Refusal() {
++    // Loader refuses a Switch 1 title whose package does not fit it (one
++    // without a module Loader requires: rtld, subsdk0 or sdk) after it closes
++    // the code mount, and creates no process. Without this, the launch would
++    // stay armed until the title next ran.
++    // Loader is no longer parked: it loads the title while this runs and
++    // changes its domain under the walk. A snapshot that fails proves
++    // nothing, so it neither ends the launch nor faults game arming.
++    const u64 now = armGetSystemTick();
++    if (refusal_next_tick_ && now < refusal_next_tick_) return 0;
++    refusal_next_tick_ = now + armNsToTicks(Switch1RefusalPollNs);
++    ounce::DomainEntry entries[ounce::MaxDomainEntries];
++    u32 count = 0;
++    GameMount final_mount(*memory_, mount_config_);
++    if (R_FAILED(final_mount.snapshot(entries, count)) ||
++        containsEntry(entries, count, code_.address)) {
++        code_closed_tick_ = 0;
++        return 0;
++    }
++    if (!code_closed_tick_) code_closed_tick_ = now;
++    if (armTicksToNs(now - code_closed_tick_) < Switch1ProcessTimeoutNs) return 0;
++    endLaunch();
++    return 0;
++}
++
++void GameArm::endLaunch() {
+     if (package_) package_->close();
+     package_.reset();
+     mount_.reset();
+@@ -628,7 +752,6 @@ Result GameArm::pollProcessExit() {
+     allow_bridge_process_ = false;
+     status_.serial++;
+     state_ = State::OpenPackage;
+-    return 0;
+ }
+ 
+ Result GameArm::restoreGate(Result result, State on_success) {
+diff --git a/hen/source/game_arm.hpp b/hen/source/game_arm.hpp
+index d93d4bf..93c0c77 100644
+--- a/hen/source/game_arm.hpp
++++ b/hen/source/game_arm.hpp
+@@ -7,6 +7,7 @@
+ #include "../../common/package.hpp"
+ #include "../../common/loader_gate.hpp"
+ #include "game_trace.hpp"
++#include "donor_build.hpp"
+ 
+ using GameMemory = ounce::RetainedMemory<ounce::MemoryWriter::RoProcess>;
+ using GameGate = ounce::LoaderGate<ounce::MemoryWriter::RoProcess>;
+@@ -49,6 +50,7 @@ class GameArm {
+         WaitRequest,
+         WaitProcess,
+         CapturePolicy,
++        BuildDonor,
+         WaitExit,
+         RecoveringGate,
+         Fault,
+@@ -60,7 +62,11 @@ class GameArm {
+     Result receiveGameMount();
+     Result waitForProcess();
+     Result capturePolicy();
++    Result buildDonor();
++    void endDonorBuild();
+     Result pollProcessExit();
++    Result pollSwitch1Refusal();
++    void endLaunch();
+     Result restoreGate(Result result, State on_success = State::WaitProcess);
+     void resumeAfterRestore(State target);
+     Result inspectGameRequest(const u8 request[ounce::LoaderRequestSize], bool& game_mount,
+@@ -107,6 +113,17 @@ class GameArm {
+     bool capture_pending_ = false;
+     u32 capture_attempts_ = 0;
+     u64 capture_next_tick_ = 0;
++    /// This Switch 1 launch opened no donor, so its running process is to
++    /// build the shared default donor.
++    bool donor_build_pending_ = false;
++    /// A default donor build has started in this HEN session; there is never
++    /// a second one.
++    bool donor_build_tried_ = false;
++    std::optional<Switch1DonorBuild> donor_build_;
++    /// When an armed Switch 1 launch was first seen without its code mount.
++    u64 code_closed_tick_ = 0;
++    /// When pollSwitch1Refusal next looks for that code mount.
++    u64 refusal_next_tick_ = 0;
+     Result recovery_primary_result_ = 0;
+     State recovery_target_ = State::Fault;
+     Result last_restore_result_ = 0;
+diff --git a/hen/source/game_title.hpp b/hen/source/game_title.hpp
+new file mode 100644
+index 0000000..60949dc
+--- /dev/null
++++ b/hen/source/game_title.hpp
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++// Which of Loader's OpenCodeFileSystem requests game arming (game_arm.cpp)
++// takes as a game's code mount, and where a Switch 1 title's donor package
++// is. Only the libnx types, so that host tests build it.
++extern "C" {
++#include <switch/types.h>
++}
++
++namespace ounce::game {
++
++// Native titles observed here use the 0x04 namespace. This is the Switch 2
++// analogue of Atmosphere's ncm::IsApplicationId range check; the exact native
++// endpoints still need live qualification against more than one game title.
++constexpr u64 NativeApplicationIdMin = 0x0400000000010000ull;
++constexpr u64 NativeApplicationIdMax = 0x04ffffffffffffffull;
++// Switch 1 titles keep their Switch 1 program IDs: Atmosphere's
++// ncm::ApplicationId range. System programs (0x0100000000000000 to
++// 0x010000000000ffff) stay outside it.
++constexpr u64 Switch1ApplicationIdMin = 0x0100000000010000ull;
++constexpr u64 Switch1ApplicationIdMax = 0x01ffffffffffffffull;
++/// The content attributes of a native game's code file system, in Loader's
++/// OpenCodeFileSystem request and in readSignedPolicy.
++constexpr u8 NativeCodeAttributes = 1;
++/// Loader opens a Switch 1 title's code file system with no content
++/// attributes.
++constexpr u8 Switch1CodeAttributes = 0;
++
++constexpr bool isNativeApplication(u64 program_id) {
++    return program_id >= NativeApplicationIdMin && program_id <= NativeApplicationIdMax;
++}
++
++constexpr bool isSwitch1Application(u64 program_id) {
++    return program_id >= Switch1ApplicationIdMin && program_id <= Switch1ApplicationIdMax;
++}
++
++/// Whether Loader's OpenCodeFileSystem arguments mount a game's code.
++constexpr bool isGameCodeMount(u64 program_id, u8 content_attributes) {
++    return (content_attributes == NativeCodeAttributes && isNativeApplication(program_id)) ||
++           (content_attributes == Switch1CodeAttributes && isSwitch1Application(program_id));
++}
++
++/// The donor package used by every Switch 1 title whose own package does not
++/// open. Loader reads the launched title's main.npdm at the first code mount,
++/// before the donor is exchanged in (measured on hardware), so that title's policy governs
++/// the donor's modules. Serving another title is unflown, and a 32-bit title
++/// cannot use a 64-bit donor.
++constexpr char Switch1DefaultPackagePath[] = "@Sdcard:/kaihen/bin/s1/default.nsp";
++/// The same donor as a path on the SD card's own file system, and the file
++/// that HEN builds it in (donor_build.hpp) before giving it this name.
++constexpr char Switch1DefaultDonorFile[] = "/kaihen/bin/s1/default.nsp";
++constexpr char Switch1DefaultDonorPart[] = "/kaihen/bin/s1/default.nsp.part";
++
++/// A Switch 1 title's donor package on SD:
++/// "@Sdcard:/kaihen/bin/s1/<program ID, 16 lowercase hex digits>.nsp".
++struct Switch1PackagePath {
++    static constexpr char Prefix[] = "@Sdcard:/kaihen/bin/s1/";
++    static constexpr char Suffix[] = ".nsp";
++    char text[sizeof(Prefix) - 1 + 16 + sizeof(Suffix)] = {};
++
++    constexpr explicit Switch1PackagePath(u64 program_id) {
++        constexpr char Digits[] = "0123456789abcdef";
++        size_t length = 0;
++        for (size_t index = 0; index < sizeof(Prefix) - 1; index++) {
++            text[length++] = Prefix[index];
++        }
++        for (int shift = 60; shift >= 0; shift -= 4) {
++            text[length++] = Digits[(program_id >> shift) & 0xf];
++        }
++        for (size_t index = 0; index < sizeof(Suffix); index++) {
++            text[length++] = Suffix[index];
++        }
++    }
++};
++
++} // namespace ounce::game
+diff --git a/hen/source/game_trace.hpp b/hen/source/game_trace.hpp
+index ced7db6..008a598 100644
+--- a/hen/source/game_trace.hpp
++++ b/hen/source/game_trace.hpp
+@@ -27,6 +27,9 @@ enum GameTracePoint : u32 {
+     GameTracePoint_PolicyCaptureAttempt = 49,
+     GameTracePoint_PolicyCaptured = 50,
+     GameTracePoint_PolicyCaptureFailed = 51,
++    GameTracePoint_DonorBuildStarted = 52,
++    GameTracePoint_DonorBuilt = 53,
++    GameTracePoint_DonorBuildFailed = 54,
+     GameTracePoint_Fault = 0xff,
+ };
+ 
+diff --git a/hen/test.sh b/hen/test.sh
+index a413b1a..e389202 100755
+--- a/hen/test.sh
++++ b/hen/test.sh
+@@ -13,3 +13,7 @@ $cxx $flags -I"$nx/include" -I../libkaihen/include tests/mount_request_test.cpp
+ build/tests/mount_request
+ $cxx $flags -I"$nx/include" -I../libkaihen/include tests/sm_request_test.cpp -o build/tests/sm_request
+ build/tests/sm_request
++$cxx $flags -I"$nx/include" tests/game_title_test.cpp -o build/tests/game_title
++build/tests/game_title
++$cxx $flags -I"$nx/include" tests/donor_layout_test.cpp -o build/tests/donor_layout
++build/tests/donor_layout
+diff --git a/hen/tests/donor_layout_test.cpp b/hen/tests/donor_layout_test.cpp
+new file mode 100644
+index 0000000..d6156ac
+--- /dev/null
++++ b/hen/tests/donor_layout_test.cpp
+@@ -0,0 +1,424 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Host test of a Switch 1 donor's layout (source/donor_layout.hpp): the
++// order, header, names and data offsets of synthetic ExeFS listings against
++// bytes that an independent PFS0 writer produced from the same files, then
++// the listings that cannot make a donor, the name filter and the magics.
++
++#include <cstdio>
++#include <cstring>
++#include "../source/donor_layout.hpp"
++
++using namespace ounce::game;
++
++namespace {
++
++int g_failures = 0;
++
++void expect(bool condition, const char* what) {
++    if (!condition) {
++        std::printf("FAIL: %s\n", what);
++        g_failures++;
++    }
++}
++
++struct ListedFile {
++    const char* name;
++    u64 size;
++};
++
++// Expected bytes: the PC donor tool's PFS0 build over files of these names
++// and sizes, written to a directory (so in its own order), with an hbloader
++// of the given size. Each listing below is in a different order from the
++// package's. Do not edit by hand.
++// typical: rtld main subsdk0 subsdk1 subsdk2 subsdk10 sdk main.npdm
++constexpr u8 Expected_typical[] = {
++    0x50, 0x46, 0x53, 0x30, 0x08, 0x00, 0x00, 0x00, 0x39, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0xe5, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0xc9, 0x81, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xe0, 0xaa, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x20, 0xab, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x60, 0xab, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x80, 0xbb, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xa0, 0xbb, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x59, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0xd7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x24, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x72, 0x74, 0x6c, 0x64, 0x00, 0x6d, 0x61, 0x69,
++    0x6e, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x30, 0x00, 0x73, 0x75,
++    0x62, 0x73, 0x64, 0x6b, 0x31, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b,
++    0x32, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x31, 0x30, 0x00, 0x73,
++    0x64, 0x6b, 0x00, 0x6d, 0x61, 0x69, 0x6e, 0x2e, 0x6e, 0x70, 0x64, 0x6d,
++    0x00,
++};
++constexpr u64 ExpectedSize_typical = 0x1df2d;
++constexpr ListedFile Listing_typical[] = {
++    {"main.npdm", 0x724},
++    {"subsdk10", 0x5},
++    {"sdk", 0x1b59},
++    {"rtld", 0x2a13},
++    {"main", 0x181c9},
++    {"subsdk0", 0x21},
++    {"subsdk2", 0x1001},
++    {"subsdk1", 0x40},
++};
++constexpr u64 Hbloader_typical = 0x28e5;
++// names: rtld main subsdk01 subsdk1 subsdk00000000000000000000002 subsdk9 subsdk10 sdk Main a.b sdk0 subsdk subsdkx zz ~ main.npdm
++constexpr u8 Expected_names[] = {
++    0x50, 0x46, 0x53, 0x30, 0x10, 0x00, 0x00, 0x00, 0x7a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1b, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x39, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4e, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x53, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x60, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x57, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5c, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xa0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6b, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6e, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xe0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x72, 0x74, 0x6c, 0x64, 0x00, 0x6d, 0x61, 0x69,
++    0x6e, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x30, 0x31, 0x00, 0x73,
++    0x75, 0x62, 0x73, 0x64, 0x6b, 0x31, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64,
++    0x6b, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
++    0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x32,
++    0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x39, 0x00, 0x73, 0x75, 0x62,
++    0x73, 0x64, 0x6b, 0x31, 0x30, 0x00, 0x73, 0x64, 0x6b, 0x00, 0x4d, 0x61,
++    0x69, 0x6e, 0x00, 0x61, 0x2e, 0x62, 0x00, 0x73, 0x64, 0x6b, 0x30, 0x00,
++    0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64,
++    0x6b, 0x78, 0x00, 0x7a, 0x7a, 0x00, 0x7e, 0x00, 0x6d, 0x61, 0x69, 0x6e,
++    0x2e, 0x6e, 0x70, 0x64, 0x6d, 0x00,
++};
++constexpr u64 ExpectedSize_names = 0x4ea;
++constexpr ListedFile Listing_names[] = {
++    {"zz", 0x0},
++    {"subsdkx", 0x4},
++    {"Main", 0x3},
++    {"subsdk10", 0x1f},
++    {"a.b", 0x1},
++    {"sdk0", 0x2},
++    {"subsdk1", 0x11},
++    {"main.npdm", 0x100},
++    {"subsdk", 0x6},
++    {"subsdk00000000000000000000002", 0x9},
++    {"subsdk01", 0x10},
++    {"subsdk9", 0x20},
++    {"~", 0x7},
++    {"sdk", 0x8},
++    {"main", 0x4},
++};
++constexpr u64 Hbloader_names = 0x33;
++// aligned: rtld main main.npdm
++constexpr u8 Expected_aligned[] = {
++    0x50, 0x46, 0x53, 0x30, 0x03, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x1f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x72, 0x74, 0x6c, 0x64, 0x00, 0x6d, 0x61, 0x69,
++    0x6e, 0x00, 0x6d, 0x61, 0x69, 0x6e, 0x2e, 0x6e, 0x70, 0x64, 0x6d, 0x00,
++};
++constexpr u64 ExpectedSize_aligned = 0xcc;
++constexpr ListedFile Listing_aligned[] = {
++    {"main", 0x20},
++    {"main.npdm", 0x20},
++};
++constexpr u64 Hbloader_aligned = 0x1f;
++// full: rtld main subsdk0 subsdk1 subsdk2 subsdk3 subsdk4 subsdk5 subsdk6 subsdk7 subsdk8 subsdk9 subsdk10 subsdk11 subsdk12 subsdk13 subsdk14 subsdk15 subsdk16 subsdk17 subsdk18 subsdk19 sdk main.npdm
++constexpr u8 Expected_full[] = {
++    0x50, 0x46, 0x53, 0x30, 0x18, 0x00, 0x00, 0x00, 0xc2, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x26, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x40, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x80, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xc0, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5a, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x40, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x2b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x80, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x2c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6c, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xc0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x2d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x75, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x2e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x40, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x2f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x87, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x80, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xc0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa2, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x40, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xab, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x80, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb4, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0xc0, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb8, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x72, 0x74, 0x6c, 0x64, 0x00, 0x6d, 0x61, 0x69,
++    0x6e, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x30, 0x00, 0x73, 0x75,
++    0x62, 0x73, 0x64, 0x6b, 0x31, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b,
++    0x32, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x33, 0x00, 0x73, 0x75,
++    0x62, 0x73, 0x64, 0x6b, 0x34, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b,
++    0x35, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x36, 0x00, 0x73, 0x75,
++    0x62, 0x73, 0x64, 0x6b, 0x37, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b,
++    0x38, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x39, 0x00, 0x73, 0x75,
++    0x62, 0x73, 0x64, 0x6b, 0x31, 0x30, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64,
++    0x6b, 0x31, 0x31, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x31, 0x32,
++    0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x31, 0x33, 0x00, 0x73, 0x75,
++    0x62, 0x73, 0x64, 0x6b, 0x31, 0x34, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64,
++    0x6b, 0x31, 0x35, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x31, 0x36,
++    0x00, 0x73, 0x75, 0x62, 0x73, 0x64, 0x6b, 0x31, 0x37, 0x00, 0x73, 0x75,
++    0x62, 0x73, 0x64, 0x6b, 0x31, 0x38, 0x00, 0x73, 0x75, 0x62, 0x73, 0x64,
++    0x6b, 0x31, 0x39, 0x00, 0x73, 0x64, 0x6b, 0x00, 0x6d, 0x61, 0x69, 0x6e,
++    0x2e, 0x6e, 0x70, 0x64, 0x6d, 0x00,
++};
++constexpr u64 ExpectedSize_full = 0x902;
++constexpr ListedFile Listing_full[] = {
++    {"rtld", 0x100},
++    {"main.npdm", 0x30},
++    {"subsdk19", 0x33},
++    {"subsdk18", 0x32},
++    {"subsdk17", 0x31},
++    {"subsdk16", 0x30},
++    {"subsdk15", 0x2f},
++    {"subsdk14", 0x2e},
++    {"subsdk13", 0x2d},
++    {"subsdk12", 0x2c},
++    {"subsdk11", 0x2b},
++    {"subsdk10", 0x2a},
++    {"subsdk9", 0x29},
++    {"subsdk8", 0x28},
++    {"subsdk7", 0x27},
++    {"subsdk6", 0x26},
++    {"subsdk5", 0x25},
++    {"subsdk4", 0x24},
++    {"subsdk3", 0x23},
++    {"subsdk2", 0x22},
++    {"subsdk1", 0x21},
++    {"subsdk0", 0x20},
++    {"main", 0x41},
++    {"sdk", 0x22},
++};
++constexpr u64 Hbloader_full = 0x40;
++
++template <size_t ListingCount>
++u32 makeTitle(const ListedFile (&listing)[ListingCount], DonorFile* title) {
++    static_assert(ListingCount <= DonorFileLimit);
++    for (size_t index = 0; index < ListingCount; index++) {
++        title[index] = {};
++        std::strcpy(title[index].name, listing[index].name);
++        title[index].size = listing[index].size;
++    }
++    return ListingCount;
++}
++
++u64 read64(const u8* bytes) {
++    u64 value = 0;
++    for (int index = 7; index >= 0; index--) value = (value << 8) | bytes[index];
++    return value;
++}
++
++template <size_t ListingCount, size_t HeaderSize>
++void checkCase(const char* what, const ListedFile (&listing)[ListingCount], u64 hbloader,
++               const u8 (&expected)[HeaderSize], u64 expected_size) {
++    DonorFile title[DonorFileLimit];
++    const u32 count = makeTitle(listing, title);
++    static DonorPlan plan;
++    if (!planDonor(title, count, hbloader, plan)) {
++        std::printf("FAIL: %s: refused\n", what);
++        g_failures++;
++        return;
++    }
++    bool same = plan.header_size == HeaderSize &&
++                std::memcmp(plan.header, expected, HeaderSize) == 0;
++    if (!same) {
++        std::printf("FAIL: %s: header differs (size %u, expected %zu)\n", what,
++                    plan.header_size, HeaderSize);
++        for (size_t index = 0; index < HeaderSize && index < plan.header_size; index++) {
++            if (plan.header[index] != expected[index]) {
++                std::printf("  first difference at %#zx: %#04x, expected %#04x\n", index,
++                            plan.header[index], expected[index]);
++                break;
++            }
++        }
++        std::printf("  order:");
++        for (u32 index = 0; index < plan.count; index++) {
++            std::printf(" %s", plan.files[index].name);
++        }
++        std::printf("\n");
++        g_failures++;
++    }
++    if (plan.size != expected_size) {
++        std::printf("FAIL: %s: package size %#llx, expected %#llx\n", what,
++                    static_cast<unsigned long long>(plan.size),
++                    static_cast<unsigned long long>(expected_size));
++        g_failures++;
++    }
++    // The copy writes each file at plan.offsets: the header's data offset
++    // from the end of the names, every one 32-byte aligned.
++    for (u32 index = 0; same && index < plan.count; index++) {
++        const u64 offset = read64(plan.header + 16 + index * 24);
++        if (plan.offsets[index] != plan.header_size + offset || offset % 0x20) {
++            std::printf("FAIL: %s: file %u offset\n", what, index);
++            g_failures++;
++        }
++        if (plan.files[index].hbloader != (index == 0)) {
++            std::printf("FAIL: %s: file %u source\n", what, index);
++            g_failures++;
++        }
++    }
++    expect(!std::strcmp(plan.files[0].name, "rtld") && plan.files[0].size == hbloader, what);
++}
++
++void checkLayouts() {
++    checkCase("typical title", Listing_typical, Hbloader_typical, Expected_typical,
++              ExpectedSize_typical);
++    checkCase("unusual names", Listing_names, Hbloader_names, Expected_names, ExpectedSize_names);
++    checkCase("aligned files", Listing_aligned, Hbloader_aligned, Expected_aligned,
++              ExpectedSize_aligned);
++    checkCase("the most files", Listing_full, Hbloader_full, Expected_full, ExpectedSize_full);
++}
++
++template <size_t ListingCount>
++bool plans(const ListedFile (&listing)[ListingCount], u64 hbloader = 0x100) {
++    DonorFile title[DonorFileLimit];
++    const u32 count = makeTitle(listing, title);
++    static DonorPlan plan;
++    return planDonor(title, count, hbloader, plan);
++}
++
++void checkRefusals() {
++    constexpr ListedFile no_main[] = {{"rtld", 4}, {"main.npdm", 0x20}, {"sdk", 4}};
++    expect(!plans(no_main), "no main");
++    constexpr ListedFile no_policy[] = {{"main", 4}, {"sdk", 4}};
++    expect(!plans(no_policy), "no main.npdm");
++    constexpr ListedFile repeated[] = {{"main", 4}, {"main.npdm", 0x20}, {"main", 8}};
++    expect(!plans(repeated), "a repeated name");
++    constexpr ListedFile separator[] = {{"main", 4}, {"main.npdm", 0x20}, {"a/b", 1}};
++    expect(!plans(separator), "a name with a separator");
++    constexpr ListedFile dot[] = {{"main", 4}, {"main.npdm", 0x20}, {"..", 1}};
++    expect(!plans(dot), "a dot name");
++    constexpr ListedFile empty[] = {{"main", 4}, {"main.npdm", 0x20}, {"", 1}};
++    expect(!plans(empty), "an empty name");
++    constexpr ListedFile large[] = {{"main", DonorFileSizeLimit + 1}, {"main.npdm", 0x20}};
++    expect(!plans(large), "a file over the size limit");
++    constexpr ListedFile fits[] = {{"main", DonorFileSizeLimit}, {"main.npdm", 0x20}};
++    expect(plans(fits), "a file at the size limit");
++    expect(!plans(fits, DonorFileSizeLimit + 1), "hbloader over the size limit");
++
++    // A title without its own rtld gains one file: 24 listed is one too many.
++    DonorFile title[DonorFileLimit + 1] = {};
++    std::strcpy(title[0].name, "main");
++    std::strcpy(title[1].name, "main.npdm");
++    for (u32 index = 2; index < DonorFileLimit + 1; index++) {
++        std::snprintf(title[index].name, sizeof(title[index].name), "subsdk%u", index);
++    }
++    static DonorPlan plan;
++    expect(!planDonor(title, DonorFileLimit, 0x100, plan), "25 files with hbloader");
++    expect(planDonor(title, DonorFileLimit - 1, 0x100, plan), "24 files with hbloader");
++    std::strcpy(title[DonorFileLimit - 1].name, "rtld");
++    expect(planDonor(title, DonorFileLimit, 0x100, plan), "24 listed with the title's rtld");
++    expect(!planDonor(title, DonorFileLimit + 1, 0x100, plan), "more listed than the limit");
++}
++
++void checkNames() {
++    expect(isDonorName("main.npdm") && isDonorName("...") && isDonorName("~"), "names taken");
++    char longest[DonorNameLimit + 2] = {};
++    std::memset(longest, 'x', DonorNameLimit);
++    expect(isDonorName(longest), "the longest name");
++    longest[DonorNameLimit] = 'x';
++    expect(!isDonorName(longest), "a name over the limit");
++    const char* refused[] = {"", ".", "..", "a b", "a\\b", "c:x", "\x7f", "tab\t"};
++    for (const char* name : refused) expect(!isDonorName(name), name);
++    expect(!isDonorName(nullptr), "no name");
++
++    expect(donorBefore("rtld", "main") && donorBefore("main", "subsdk0") &&
++               donorBefore("subsdk0", "sdk") && donorBefore("sdk", "a") &&
++               donorBefore("zz", "main.npdm"),
++           "rank order");
++    expect(donorBefore("subsdk9", "subsdk10") && !donorBefore("subsdk10", "subsdk9"),
++           "subsdk by value");
++    expect(donorBefore("subsdk01", "subsdk1") && !donorBefore("subsdk1", "subsdk01"),
++           "equal values by name");
++    expect(!donorBefore("main", "main"), "a name is not before itself");
++
++    expect(!std::strcmp(donorMagic("main.npdm"), "META"), "policy magic");
++    const char* modules[] = {"rtld", "main", "sdk", "subsdk0", "subsdk", "subsdkx"};
++    for (const char* name : modules) {
++        expect(donorMagic(name) && !std::strcmp(donorMagic(name), "NSO0"), name);
++    }
++    expect(!donorMagic("sdk0") && !donorMagic("Main") && !donorMagic("zz"), "no magic");
++
++    u8 meta[MetaFlagsOffset + 1] = {'M', 'E', 'T', 'A'};
++    meta[MetaFlagsOffset] = 0x3f;
++    expect(isDonorPolicy(meta, sizeof(meta)), "a 64-bit policy");
++    expect(!isDonorPolicy(meta, sizeof(meta) - 1), "a short policy");
++    meta[MetaFlagsOffset] = 0x3e;
++    expect(!isDonorPolicy(meta, sizeof(meta)), "a 32-bit policy");
++    meta[MetaFlagsOffset] = 1;
++    meta[3] = 'B';
++    expect(!isDonorPolicy(meta, sizeof(meta)), "not META");
++}
++
++} // namespace
++
++int main() {
++    checkLayouts();
++    checkRefusals();
++    checkNames();
++    if (g_failures) {
++        std::printf("donor layout test: FAIL (%d)\n", g_failures);
++        return 1;
++    }
++    std::printf("donor layout test: PASS\n");
++    return 0;
++}
+diff --git a/hen/tests/game_title_test.cpp b/hen/tests/game_title_test.cpp
+new file mode 100644
+index 0000000..5371d45
+--- /dev/null
++++ b/hen/tests/game_title_test.cpp
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Host test of the code mounts that game arming takes (source/game_title.hpp):
++// both edges of each program ID range, and the content attributes, then the
++// path of a Switch 1 title's donor package. The title IDs are made up.
++
++#include <cstdio>
++#include <cstring>
++#include "../source/game_title.hpp"
++
++using namespace ounce::game;
++
++namespace {
++
++int g_failures = 0;
++
++void expect(bool condition, const char* what) {
++    if (!condition) {
++        std::printf("FAIL: %s\n", what);
++        g_failures++;
++    }
++}
++
++struct Mount {
++    u64 program_id;
++    u8 attributes;
++    bool taken;
++    const char* what;
++};
++
++constexpr Mount Mounts[] = {
++    {0x0400000000100000ull, 1, true, "native application"},
++    {0x0400000000010000ull, 1, true, "first native application"},
++    {0x04ffffffffffffffull, 1, true, "last native application"},
++    {0x040000000000ffffull, 1, false, "last native system program"},
++    {0x0400000000001000ull, 1, false, "native system program"},
++    {0x0500000000000000ull, 1, false, "above the native range"},
++    {0x03ffffffffffffffull, 1, false, "below the native range"},
++    {0x0400000000100000ull, 0, false, "native application without attributes"},
++    {0x0400000000100000ull, 2, false, "native application, other attributes"},
++    {0, 1, false, "program 0"},
++    {0x0100000000100000ull, 0, true, "Switch 1 application"},
++    {0x0100000000010000ull, 0, true, "first Switch 1 application"},
++    {0x01ffffffffffffffull, 0, true, "last Switch 1 application"},
++    {0x010000000000ffffull, 0, false, "last Switch 1 system program"},
++    {0x0100000000001000ull, 0, false, "Switch 1 system program"},
++    {0x0200000000000000ull, 0, false, "above the Switch 1 range"},
++    {0x00ffffffffffffffull, 0, false, "below the Switch 1 range"},
++    {0x0100000000100000ull, 1, false, "Switch 1 application with native attributes"},
++    {0x0100000000100000ull, 2, false, "Switch 1 application, other attributes"},
++    {0x0400000000001000ull, 0, false, "native system program without attributes"},
++    {0, 0, false, "program 0 without attributes"},
++};
++
++void checkMounts() {
++    for (const Mount& mount : Mounts) {
++        if (isGameCodeMount(mount.program_id, mount.attributes) != mount.taken) {
++            std::printf("FAIL: %s: program %#llx attributes %u\n", mount.what,
++                        static_cast<unsigned long long>(mount.program_id), mount.attributes);
++            g_failures++;
++        }
++    }
++    expect(isNativeApplication(NativeApplicationIdMin), "native minimum");
++    expect(!isNativeApplication(NativeApplicationIdMin - 1), "below the native minimum");
++    expect(isSwitch1Application(Switch1ApplicationIdMin), "Switch 1 minimum");
++    expect(!isSwitch1Application(Switch1ApplicationIdMin - 1), "below the Switch 1 minimum");
++    expect(!isNativeApplication(Switch1ApplicationIdMax), "the ranges do not overlap");
++}
++
++void checkPackagePath() {
++    expect(std::strcmp(Switch1DefaultPackagePath, "@Sdcard:/kaihen/bin/s1/default.nsp") == 0,
++           "default package path");
++    expect(std::strcmp(Switch1DefaultPackagePath + sizeof("@Sdcard:") - 1,
++                       Switch1DefaultDonorFile) == 0,
++           "default donor file is the default package");
++    expect(std::strncmp(Switch1DefaultDonorPart, Switch1DefaultDonorFile,
++                        sizeof(Switch1DefaultDonorFile) - 1) == 0 &&
++               std::strcmp(Switch1DefaultDonorPart + sizeof(Switch1DefaultDonorFile) - 1,
++                           ".part") == 0,
++           "default donor part file");
++    const Switch1PackagePath path(0x0100000000100000ull);
++    expect(std::strcmp(path.text, "@Sdcard:/kaihen/bin/s1/0100000000100000.nsp") == 0,
++           "package path");
++    expect(std::strlen(path.text) + 1 == sizeof(path.text), "package path fills its buffer");
++    const Switch1PackagePath digits(0x01234567890abcdeull);
++    expect(std::strcmp(digits.text, "@Sdcard:/kaihen/bin/s1/01234567890abcde.nsp") == 0,
++           "lowercase hex digits");
++    constexpr Switch1PackagePath last(Switch1ApplicationIdMax);
++    static_assert(last.text[sizeof(last.text) - 2] == 'p' && last.text[sizeof(last.text) - 1] == 0);
++    expect(std::strcmp(last.text, "@Sdcard:/kaihen/bin/s1/01ffffffffffffff.nsp") == 0,
++           "last Switch 1 application");
++}
++
++} // namespace
++
++int main() {
++    checkMounts();
++    checkPackagePath();
++    std::printf("%zu code mounts\n", sizeof(Mounts) / sizeof(Mounts[0]));
++    if (g_failures) {
++        std::printf("game title test: FAIL (%d)\n", g_failures);
++        return 1;
++    }
++    std::printf("game title test: PASS\n");
++    return 0;
++}
